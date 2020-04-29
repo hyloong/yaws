@@ -20,6 +20,10 @@ all() ->
      flush_small_post,
      flush_large_post,
      flush_chunked_post,
+     post_multi_different_content_length,
+     post_multi_same_content_length,
+     post_bogus_transfer_encoding,
+     post_bad_order_transfer_encoding,
      flush_small_get,
      flush_large_get,
      flush_chunked_get,
@@ -320,6 +324,71 @@ flush_chunked_post(Config) ->
     ?assertMatch({ok, {{_,200,_}, _, _}}, testsuite:receive_http_response(Sock)),
     ?assertEqual(ok, gen_tcp:close(Sock)),
     ok.
+
+post_multi_different_content_length(Config) ->
+    Body = "body doesn't matter for this test",
+    Sz = integer_to_list(length(Body)),
+
+    Port  = testsuite:get_yaws_port(1, Config),
+    Url   = testsuite:make_url(http, "127.0.0.1", Port, "/posttest/"++Sz),
+    BadCL = "42",
+    ClHdr1 = {"Content-Length", Sz},
+    ClHdr2 = {"Content-Length", BadCL},
+    CT     = "binary/octet-stream",
+    ?assertMatch({ok, {{_,400,_}, _, _}}, testsuite:http_post(Url, [ClHdr1,ClHdr2], {CT, Body})),
+    ok.
+
+post_multi_same_content_length(Config) ->
+    File = filename:join(?tempdir(?MODULE), "www/1000.txt"),
+    {ok, FI}  = file:read_file_info(File),
+    Sz = integer_to_list(FI#file_info.size),
+
+    Port  = testsuite:get_yaws_port(1, Config),
+    Url   = testsuite:make_url(http, "127.0.0.1", Port, "/posttest/"++Sz),
+    ClHdr = {"Content-Length", Sz},
+    CT    = "binary/octet-stream",
+    Body  = {fun testsuite:post_file/1, {File,1024000}},
+    ?assertMatch({ok, {{_,200,_}, _, _}}, testsuite:http_post(Url, [ClHdr,ClHdr], {CT, Body})),
+    ok.
+
+post_transfer_encoding(Config, TE, StatusCode) ->
+    Port = testsuite:get_yaws_port(1, Config),
+    Url  = testsuite:make_url(http, "127.0.0.1", Port, "/posttest/chunked/5"),
+    {ok, {Scheme, _, Host, Port, Path, _}} = yaws_dynopts:http_uri_parse(Url),
+    case testsuite:sock_connect(Scheme, Host, Port, [binary,{active,false}], infinity) of
+        {ok, Sock} ->
+            try
+                Req = ["POST " ++ Path ++ " HTTP/1.1\r\n",
+                       "Host: " ++ Host ++ "\r\n",
+                       "User-Agent: Yaws HTTP client\r\n",
+                       "Transfer-Encoding: " ++ TE ++ "\r\n",
+                       "\r\n",
+                       "5\r\n",
+                       "hello\r\n",
+                       "0\r\n"],
+                ok = gen_tcp:send(Sock, Req),
+                ?assertMatch({ok,{{_,StatusCode,_},_,_}}, testsuite:receive_http_response(Sock))
+            after
+                testsuite:sock_close(Sock)
+            end;
+        Error ->
+            ?assertMatch(ok, Error)
+    end,
+    ok.
+
+post_bogus_transfer_encoding(Config) ->
+    %% RFC 7230 secrion 3.3.1 "A server that receives a request
+    %% message with a transfer coding it does not understand SHOULD
+    %% respond with 501 (Not Implemented)."
+    post_transfer_encoding(Config, "bogus", 501).
+
+post_bad_order_transfer_encoding(Config) ->
+    %% RFC 7230 3.3.3 list item 3 states: "If a Transfer-Encoding
+    %% header field is present in a request and the chunked transfer
+    %% coding is not the final encoding, the message body length
+    %% cannot be determined reliably; the server MUST respond with the
+    %% 400 (Bad Request) status code and then close the connection."
+    post_transfer_encoding(Config, "chunked, gzip", 400).
 
 flush_small_get(Config) ->
     File = filename:join(?tempdir(?MODULE), "www/1000.txt"),

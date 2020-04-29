@@ -1215,6 +1215,18 @@ aloop(CliSock, {IP,Port}=IPPort, GS, Num) ->
                     deliver_431(CliSock, ReqTooMany, NoArg)
             end,
             {ok, Num+1};
+        {error, {multiple_content_length_headers, ReqMultiCL}} ->
+            %% RFC 7230 status code 400
+            ?Debug("Multiple Content-Length headers~n", []),
+            case pick_sconf(GS#gs.gconf, #headers{}, GS#gs.group) of
+                undefined ->
+                    deliver_400(CliSock, ReqMultiCL, NoArg);
+                SC ->
+                    put(sc, SC),
+                    put(outh, #outh{}),
+                    deliver_400(CliSock, ReqMultiCL, NoArg)
+            end,
+            {ok, Num+1};
         {Req0, H0} when Req0#http_request.method /= bad_request ->
             {Req, H} = fix_abs_uri(Req0, H0),
             ?Debug("{Req, H} = ~p~n", [{Req, H}]),
@@ -1731,10 +1743,22 @@ body_method(CliSock, IPPort, Req, Head) ->
                 _ -> ok
             end
     end,
-    Res = case {yaws:to_lower(Head#headers.transfer_encoding),
-                Head#headers.content_length} of
-              {"chunked", _} ->
+    TEHdrs = lists:reverse(yaws:split_sep(
+                             yaws:to_lower(Head#headers.transfer_encoding), $,)),
+    Res = case {TEHdrs, Head#headers.content_length} of
+              {["chunked"|_], _} ->
                   get_chunked_client_data(CliSock, yaws:is_ssl(SC));
+              {TE, _} when Head#headers.transfer_encoding /= undefined ->
+                  TEHdr = yaws:join_sep(lists:reverse(TE),","),
+                  case lists:member("chunked", TE) of
+                      true ->
+                          {error,
+                           "Transfer-Encoding header must specify \"chunked\" last: " ++
+                               TEHdr};
+                      false ->
+                          {error, "Unimplemented Transfer-Encoding: " ++ TEHdr,
+                           fun deliver_501/3}
+                  end;
               {_, undefined} ->
                   <<>>;
               {_, Len} ->
@@ -1751,6 +1775,9 @@ body_method(CliSock, IPPort, Req, Head) ->
                   end
           end,
     case Res of
+        {error, Reason, DeliverStatus} ->
+            error_logger:format("Invalid Request: ~p~n", [Reason]),
+            DeliverStatus(CliSock, Req, undefined);
         {error, Reason} ->
             error_logger:format("Invalid Request: ~p~n", [Reason]),
             deliver_400(CliSock, Req, undefined);
@@ -1937,7 +1964,8 @@ handle_request(CliSock, ARG, N) ->
                                           data = {yaws_revproxy, []}},
                             ARG1 = ARG#arg{server_path = DecPath,
                                            querydata   = QueryString,
-                                           state       = PP},
+                                           state       = PP,
+                                           appmod_name = yaws_revproxy},
                             handle_normal_request(CliSock, ARG1, UT,
                                                   SC#sconf.authdirs, N)
                     end
@@ -1964,7 +1992,7 @@ handle_normal_request(CliSock, ARG, UT, Authdirs, N) ->
             %% appmod_prepath with prepath.
             case UT#urltype.type of
                 appmod ->
-                    {_Mod, PathInfo} = UT#urltype.data,
+                    {Mod, PathInfo} = UT#urltype.data,
                     Appmoddata = case PathInfo of
                                      undefined ->
                                          undefined;
@@ -1975,7 +2003,8 @@ handle_normal_request(CliSock, ARG, UT, Authdirs, N) ->
                                                          PathInfo)
                                  end,
                     ARG2 = ARG1#arg{appmoddata     = Appmoddata,
-                                    appmod_prepath = UT#urltype.dir};
+                                    appmod_prepath = UT#urltype.dir,
+                                    appmod_name    = Mod};
                 _ ->
                     ARG2 = ARG1
             end,
@@ -1987,7 +2016,6 @@ handle_normal_request(CliSock, ARG, UT, Authdirs, N) ->
                            path = ARG1#arg.server_path},
             handle_ut(CliSock, ARG1, UT1, N)
     end.
-
 
 set_auth_user(ARG, User) ->
     H = ARG#arg.headers,
@@ -3870,9 +3898,11 @@ deflate_accumulated(Arg, Content, ContentLength, Mode) ->
 get_more_post_data(CliSock, PPS, ARG) ->
     SC = get(sc),
     N = SC#sconf.partial_post_size,
-    case {yaws:to_lower((ARG#arg.headers)#headers.transfer_encoding),
-          (ARG#arg.headers)#headers.content_length} of
-        {"chunked", _} ->
+    Hdrs = ARG#arg.headers,
+    TEHdrs = lists:reverse(yaws:split_sep(yaws:to_lower(
+                                            Hdrs #headers.transfer_encoding), $,)),
+    case {TEHdrs, Hdrs#headers.content_length} of
+        {["chunked"|_], _} ->
             get_chunked_client_data(CliSock, yaws:is_ssl(SC));
         {_, undefined} ->
             <<>>;
@@ -3891,7 +3921,6 @@ ut_read(UT) ->
     ?Debug("ut_read() UT.fullpath = ~p~n", [UT#urltype.fullpath]),
     CE = yaws:outh_get_content_encoding(),
     if
-
         (CE =:= identity) andalso is_binary(UT#urltype.data) ->
             UT#urltype.data;
         CE =:= identity ->

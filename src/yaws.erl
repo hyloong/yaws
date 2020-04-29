@@ -2012,6 +2012,8 @@ extra_response_headers(Extras, Arg, Status) ->
                                            string:tokens(lists:flatten(Other), "\r\n"));
                           (undefined, Acc) ->
                                Acc;
+                          ([], Acc) ->
+                               Acc;
                           (Hdr, Acc) ->
                                {H,V} = split_header(strip_spaces(lists:flatten(Hdr))),
                                maps:put(H, V, Acc)
@@ -2753,9 +2755,18 @@ http_collect_headers(CliSock, Req, H, SSL, Count) when Count < 1000 ->
             http_collect_headers(CliSock, Req, H#headers{keep_alive = X},
                                  SSL, Count+1);
         {ok, {http_header, _Num, 'Content-Length', _, X}} ->
-            http_collect_headers(CliSock, Req,
-                                 H#headers{content_length = X},SSL,
-                                 Count+1);
+            case H#headers.content_length of
+                undefined ->
+                    http_collect_headers(CliSock, Req,
+                                         H#headers{content_length = X},SSL,
+                                         Count+1);
+                X ->
+                    %% duplicate header, ignore it
+                    http_collect_headers(CliSock, Req, H, SSL, Count+1);
+                _ ->
+                    {error, {multiple_content_length_headers,
+                             Req#http_request{method=bad_request}}}
+            end;
         {ok, {http_header, _Num, 'Content-Type', _, X}} ->
             http_collect_headers(CliSock, Req,
                                  H#headers{content_type = X},SSL, Count+1);
@@ -2763,8 +2774,20 @@ http_collect_headers(CliSock, Req, H, SSL, Count) when Count < 1000 ->
             http_collect_headers(CliSock, Req,
                                  H#headers{content_encoding = X},SSL, Count+1);
         {ok, {http_header, _Num, 'Transfer-Encoding', _, X}} ->
-            http_collect_headers(CliSock, Req,
-                                 H#headers{transfer_encoding=X},SSL, Count+1);
+            case H#headers.transfer_encoding of
+                undefined ->
+                    http_collect_headers(CliSock, Req,
+                                         H#headers{transfer_encoding=X},SSL,
+                                         Count+1);
+                X ->
+                    %% duplicate header, ignore it
+                    http_collect_headers(CliSock, Req, H, SSL, Count+1);
+                TE ->
+                    NewTE = TE ++ ", " ++ X,
+                    http_collect_headers(CliSock, Req,
+                                         H#headers{transfer_encoding=NewTE},SSL,
+                                         Count+1)
+            end;
         {ok, {http_header, _Num, 'Location', _, X}} ->
             http_collect_headers(CliSock, Req, H#headers{location=X},
                                  SSL, Count+1);
@@ -2804,7 +2827,8 @@ http_collect_headers(CliSock, Req, H, SSL, Count) when Count < 1000 ->
             http_collect_headers(CliSock, Req,
                                  H#headers{other=[X|H#headers.other]},
                                  SSL, Count+1);
-        _Err ->
+        Err ->
+            error_logger:format("Unhandled reply from yaws:do_recv(): ~p~n", [Err]),
             exit(normal)
 
     end;

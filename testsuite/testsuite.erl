@@ -22,7 +22,9 @@
          post_file/1,
 
          add_yaws_server/2, delete_yaws_server/1, reset_yaws_servers/0,
-         yaws_servers/0, make_url/4, get_yaws_port/2
+         yaws_servers/0, make_url/4, get_yaws_port/2,
+
+         sock_connect/5, sock_close/1
         ]).
 
 
@@ -475,7 +477,7 @@ set_default_sockopts(http, SockOpts) ->
 
 
 parse_url(Url, HttpOpts) ->
-    {ok, {Scheme, _, Host, Port, Path, QS}} = http_uri:parse(Url),
+    {ok, {Scheme, _, Host, Port, Path, QS}} = yaws_dynopts:http_uri_parse(Url),
     case lists:keyfind(proxy, 1, HttpOpts) of
         {proxy, {PHost, PPort}} -> {Scheme, PHost, PPort, Url};
         false                   -> {Scheme, Host,  Port,  Path++QS}
